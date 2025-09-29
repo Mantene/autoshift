@@ -30,4 +30,4 @@ jobs:
           push: true
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/autoshift:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/autoshift:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/autoshift:${{ secrets.MAJOR_VERSION }}.${{ GITHUB_RUN_NUMBER }}
