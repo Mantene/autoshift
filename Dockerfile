@@ -1,7 +1,7 @@
 FROM python:3.10-slim
 
-ENV SHIFT_ARGS='--schedule' \
-    TZ='America/Chicago'
+ENV SHIFT_ARGS='--redeem bl4:steam --schedule' \
+    TZ='America/New_York'
 
 COPY . /autoshift/
 RUN pip install -r ./autoshift/requirements.txt && \
