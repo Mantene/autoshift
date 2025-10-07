@@ -49,6 +49,7 @@ from shift import Status
 # Static choices so CLI parsing doesn't need to import query/db
 STATIC_GAMES = ["bl4", "bl3", "blps", "bl2", "bl1", "ttw", "gdfll"]
 STATIC_PLATFORMS = ["epic", "steam", "xboxlive", "psn", "nintendo", "stadia"]
+SLEEP_TIMER = int(os.getenv("SLEEP_TIMER", "60"))
 
 if TYPE_CHECKING:
     from query import Key
@@ -746,7 +747,10 @@ def main(args):
                             f"{ng_total} {'Non-Golden Key' if ng_total==1 else 'Non-Golden Keys'})"
                         )
                     else:
-                        line += " (Ignoring 0 Golden Keys, 0 Non-Golden Keys, 0 Codes)"
+                        # Suppress the zero-ignore summary when running with default flags
+                        # line += " (Ignoring 0 Golden Keys, 0 Non-Golden Keys, 0 Codes)"
+                        if not line.endswith("."):
+                            line += "."
 
                 _L.info(line)
 
@@ -779,8 +783,10 @@ def main(args):
                         if client.last_status == Status.SLOWDOWN:
                             _L.info("Slowing down a bit..")
                         else:
-                            _L.info("Trying to prevent a 'too many requests'-block.")
-                        sleep(60)
+                            _L.info(
+                                f"Trying to prevent a 'too many requests'-block. [{SLEEP_TIMER}s]"
+                            )
+                        sleep(SLEEP_TIMER)
 
                     # Skip items that won't be attempted in this mode (belt-and-braces)
                     if union_mode:
@@ -819,6 +825,8 @@ def main(args):
                         continue
                     if disposition == "skip":
                         _log_auto_skip(normalized_code, candidate, bypass_fail)
+                        if client.last_status == Status.SLOWDOWN:
+                            client.last_status = Status.NONE
                         if (
                             candidate.skip_reason == "expired"
                             and candidate.should_record_preclassification
@@ -879,10 +887,10 @@ def main(args):
                         status = getattr(client, "last_status", Status.NONE)
                         if status == Status.SLOWDOWN and not slowdown_retry:
                             _L.info(
-                                "Auto redeem hit SLOWDOWN; sleeping 60s before retrying same code."
+                                f"Auto redeem hit SLOWDOWN; sleeping {SLEEP_TIMER}s before retrying same code."
                             )
                             slowdown_retry = True
-                            sleep(60)
+                            sleep(SLEEP_TIMER)
                             continue
                         if status == Status.SLOWDOWN:
                             _L.info(
