@@ -34,7 +34,17 @@ if "--profile" in sys.argv:
 from collections import deque
 from typing import TYPE_CHECKING, Optional
 
-from common import _L, DEBUG, INFO, SLEEP_TIMER, data_path, DATA_DIR, PROFILE
+from common import (
+    _L,
+    DEBUG,
+    INFO,
+    SLEEP_TIMER,
+    data_path,
+    DATA_DIR,
+    PROFILE,
+    dim_text,
+)
+from rich.markup import escape
 from m_redeem import maybe_handle_manual_redeem
 from redeem_logic import (
     RedemptionCandidate,
@@ -143,16 +153,34 @@ def _key_for_candidate(candidate: RedemptionCandidate) -> Key:
     )
 
 
-def _log_auto_skip(code: str, candidate: RedemptionCandidate, _bypass_fail: bool) -> None:
+def _log_auto_skip(
+    code: str, candidate: RedemptionCandidate, _bypass_fail: bool
+) -> Optional[tuple[str, str]]:
+    import query
     label = _format_pair(code, candidate)
+
+    def _bucket_label() -> str:
+        reward_text = (getattr(candidate, "reward", "") or "").strip()
+        if query.r_golden_keys.match(reward_text):
+            return "Golden Key"
+        if "key" in reward_text.lower():
+            return "Non-Golden Key"
+        return "Code"
+
+    bucket = _bucket_label()
+
     if candidate.skip_reason == "redeemed":
-        status = candidate.previously_redeemed_status or "UNKNOWN"
-        _L.debug(
-            f"{label}: previously recorded success ({status}); skipping remote call."
-        )
+        status = (candidate.previously_redeemed_status or "UNKNOWN").upper()
+        reward = (getattr(candidate, "reward", "") or "Unknown").strip()
+        raw_detail = f"IGNORED {bucket} ({reward}) [{status}]: {candidate.code or code}"
+        detail = f"[#FFD700]{escape(raw_detail)}[/]"
+        return "ignored", detail
     elif candidate.skip_reason == "failed":
-        reason = candidate.previously_failed or "UNKNOWN"
-        _L.debug(f"{label}: previously recorded failure ({reason}); skipping remote call.")
+        reason = (candidate.previously_failed or "UNKNOWN").upper()
+        reward = (getattr(candidate, "reward", "") or "Unknown").strip()
+        raw_detail = f"FAILED {bucket} ({reward}) [{reason}]: {candidate.code or code}"
+        detail = f"[#AF0000]{escape(raw_detail)}[/]"
+        return "failed", detail
     elif candidate.skip_reason == "expired":
         _L.debug(f"{label}: source expired; recording EXPIRED without remote call.")
     elif candidate.skip_reason is None:
@@ -160,6 +188,7 @@ def _log_auto_skip(code: str, candidate: RedemptionCandidate, _bypass_fail: bool
         return
     else:
         _L.debug(f"{label}: skipping ({candidate.skip_reason or 'unknown'}).")
+    return None
 
 
 def parse_redeem_mapping(args):
@@ -213,6 +242,9 @@ def query_keys_with_mapping(redeem_mapping, games, platforms):
         for g in games:
             all_keys[g] = {p: [] for p in platforms}
 
+    if _L.isEnabledFor(DEBUG):
+        _L.debug("Staging raw key entries per platform (duplicates still visible until summary).")
+
     for g, g_keys in groupby(sorted(new_keys, key=_g), _g):
         if redeem_mapping:
             if g not in redeem_mapping:
@@ -234,26 +266,81 @@ def query_keys_with_mapping(redeem_mapping, games, platforms):
             for key in p_keys:
                 temp_key = key
                 for p in _ps:
-                    _L.debug(f"Platform: {p}, {key}")
+                    platform_msg = dim_text(f"Platform: {p}, {key}")
+                    _L.debug(platform_msg, extra={"rich_markup": True})
                     all_keys[g][p].append(temp_key.copy().set(platform=p))
 
+    def _count_reward_rows(rows):
+        golden = 0
+        non_golden = 0
+        for row in rows:
+            reward_value = (row["reward"] or "").strip()
+            if query.r_golden_keys.match(reward_value):
+                golden += 1
+            elif "key" in reward_value.lower():
+                non_golden += 1
+        codes = max(0, len(rows) - golden - non_golden)
+        return golden, non_golden, codes
+
+    def _split_summary_rows(game_key: str, platform_key: str):
+        rows = query.db.execute(
+            """
+            SELECT keys.id,
+                   keys.code,
+                   keys.reward,
+                   keys.platform
+            FROM keys
+            WHERE keys.game = ?
+              AND (keys.platform = ? OR keys.platform = 'universal')
+              AND keys.id NOT IN (SELECT key_id FROM redeemed_keys)
+            ORDER BY keys.id DESC
+            """,
+            (game_key, platform_key),
+        ).fetchall()
+
+        by_code = {}
+        for row in rows:
+            code = row["code"]
+            existing = by_code.get(code)
+            if existing is None:
+                by_code[code] = row
+                continue
+            if existing["platform"] == "universal" and row["platform"] == platform_key:
+                by_code[code] = row
+
+        platform_rows = []
+        universal_rows = []
+        for row in by_code.values():
+            if row["platform"] == "universal":
+                universal_rows.append(row)
+            else:
+                platform_rows.append(row)
+
+        if not platform_rows and universal_rows:
+            platform_rows = universal_rows
+            universal_rows = []
+        return platform_rows, universal_rows
+
     # Always print info for all requested game/platform pairs
-    # DEV NOTE: This summary mirrors the new About-to-redeem breakdown: Golden vs Non-Golden vs Other Codes.
-    #          It replaces the old 'golden-only' summary so users can see per-category counts up front.
+    # DEV NOTE: This summary now distinguishes platform-specific totals from universal-only leftovers so the lead-in
+    #           matches the failure/ignored breakdown while still surfacing cross-platform stock.
     for g in all_keys:
         for p in all_keys[g]:
-            keys_list = [k for k in all_keys[g][p] if not getattr(k, "redeemed", False)]
-            # Split into Golden, non-golden Keys, and Codes to mirror the "About to redeem" summary
-            golden_count = sum(1 for k in keys_list if query.r_golden_keys.match((k.reward or "")))
-            non_golden_count = sum(
-                1
-                for k in keys_list
-                if ("key" in (k.reward or "").lower()) and not query.r_golden_keys.match((k.reward or ""))
-            )
-            codes_count = max(0, len(keys_list) - golden_count - non_golden_count)
+            platform_rows, universal_rows = _split_summary_rows(g, p)
+            if not platform_rows and not universal_rows:
+                _L.info(f"No unredeemed keys or codes for {g} on {p}")
+                continue
+
+            golden_count, non_golden_count, codes_count = _count_reward_rows(platform_rows)
             _L.info(
                 f"You have {golden_count} Golden Keys, {non_golden_count} Non-Golden Keys, {codes_count} Other Codes for {g} to redeem for {p}"
             )
+
+            if universal_rows:
+                u_golden, u_non_golden, u_codes = _count_reward_rows(universal_rows)
+                _L.info(
+                    f"\t+{u_golden} Golden Keys, +{u_non_golden} Non-Golden Keys, +{u_codes} Other Codes stored as universal (available for other platforms)."
+                )
 
     return all_keys
 
@@ -535,21 +622,63 @@ def main(args):
                 _L.info(f"Redeeming for {game} on {platform}")
                 t_keys = list(
                     filter(lambda key: not key.redeemed, all_keys[game][platform])
-                )                # Build categories & prioritised queue (global --limit aware; mode respected)
+                )
+                # Deduplicate codes per platform, preferring platform-specific copies over universal
+                dedup_map: dict[str, Key] = {}
+                for key in t_keys:
+                    code = getattr(key, "code", None)
+                    if not code:
+                        continue
+                    existing = dedup_map.get(code)
+                    if existing is None:
+                        dedup_map[code] = key
+                    elif getattr(existing, "platform", None) == "universal" and getattr(key, "platform", None) != "universal":
+                        dedup_map[code] = key
+                t_keys = list(dedup_map.values())
+
+                # Build categories & prioritised queue (global --limit aware; mode respected)
                 # DEV NOTE: Classification rules
                 #   - Golden Keys: reward matches r_golden_keys
                 #   - Non-Golden Keys: reward contains 'key' but not golden (e.g., Diamond keys)
                 #   - Codes: everything else (Unknown/cosmetics/etc.)
                 # This powers mode filtering and the per-category limit math.
-                def _is_key_reward(k):
+                def _reward_text(obj) -> str:
+                    if isinstance(obj, str):
+                        return obj or ""
                     try:
-                        rv = (getattr(k, "reward", "") or "").lower()
-                        return "key" in rv
+                        return getattr(obj, "reward", "") or ""
                     except Exception:
-                        return False
+                        return ""
 
-                def _is_golden(k):
-                    return bool(r_golden_keys.match((getattr(k, "reward", "") or "")))
+                def _is_key_reward(obj) -> bool:
+                    return "key" in _reward_text(obj).lower()
+
+                def _is_golden(obj) -> bool:
+                    return bool(r_golden_keys.match(_reward_text(obj)))
+
+                def _load_failed_totals(game_key: str, platform_key: str) -> tuple[int, int, int]:
+                    rows = query.db.execute(
+                        """
+                        SELECT keys.reward
+                        FROM failed_keys fk
+                        JOIN keys ON keys.id = fk.key_id
+                        WHERE keys.game = ?
+                          AND ((? IS NULL AND fk.platform IS NULL) OR fk.platform = ?)
+                        """,
+                        (game_key, platform_key, platform_key),
+                    ).fetchall()
+                    g_total = 0
+                    ng_total = 0
+                    c_total = 0
+                    for row in rows:
+                        reward_value = row["reward"] or ""
+                        if _is_golden(reward_value):
+                            g_total += 1
+                        elif _is_key_reward(reward_value):
+                            ng_total += 1
+                        else:
+                            c_total += 1
+                    return g_total, ng_total, c_total
 
                 # Category lists (Codes are anything that is not a *key*; Unknowns land here)
                 golden_list        = [k for k in t_keys if _is_golden(k)]
@@ -766,10 +895,12 @@ def main(args):
                 ignored_redeemed_g = 0
                 ignored_redeemed_ng = 0
                 ignored_redeemed_codes = 0
+                ignored_detail_logs: list[str] = []
 
                 failed_g = 0
                 failed_ng = 0
                 failed_codes = 0
+                failed_detail_logs: list[str] = []
 
                 pending_queue = deque(redeem_queue)
                 overflow_index = len(redeem_queue)
@@ -825,7 +956,15 @@ def main(args):
                         )
                         continue
                     if disposition == "skip":
-                        _log_auto_skip(normalized_code, candidate, bypass_fail)
+                        detail_entry = _log_auto_skip(normalized_code, candidate, bypass_fail)
+                        if detail_entry:
+                            category, detail = detail_entry
+                            if category == "ignored":
+                                ignored_detail_logs.append(detail)
+                            elif category == "failed":
+                                failed_detail_logs.append(detail)
+                            else:
+                                _L.debug(detail)
                         if client.last_status == Status.SLOWDOWN:
                             client.last_status = Status.NONE
                         if (
@@ -967,15 +1106,22 @@ def main(args):
                             failed_codes += 1
                         # don't abort the entire run on TRY LATER; keep processing remaining queue
 
-                ignored_total = ignored_redeemed_g + ignored_redeemed_ng + ignored_redeemed_codes
-                if ignored_total:
-                    _L.info(
-                        f"\t{ignored_redeemed_g} Golden Keys, {ignored_redeemed_ng} Non-Golden Keys, {ignored_redeemed_codes} Codes IGNORED (already redeemed)."
-                    )
-
+                # Always show ignored counts so mode-specific runs still report what was skipped.
                 _L.info(
-                    f"\t{failed_g} Golden Keys, {failed_ng} Non-Golden Keys, {failed_codes} Codes FAILED."
+                    f"\t{ignored_redeemed_g} Golden Keys, {ignored_redeemed_ng} Non-Golden Keys, {ignored_redeemed_codes} Codes IGNORED (already redeemed)."
                 )
+                if ignored_detail_logs:
+                    for detail in dict.fromkeys(ignored_detail_logs):
+                        _L.debug(f"\t{detail}", extra={"rich_markup": True})
+
+                # Pull failure totals from the persisted failed_keys table (includes current session updates).
+                total_failed_g, total_failed_ng, total_failed_codes = _load_failed_totals(game, platform)
+                _L.info(
+                    f"\t{total_failed_g} Golden Keys, {total_failed_ng} Non-Golden Keys, {total_failed_codes} Codes FAILED."
+                )
+                if failed_detail_logs:
+                    for detail in dict.fromkeys(failed_detail_logs):
+                        _L.debug(f"\t{detail}", extra={"rich_markup": True})
 
         # Final end-of-run label: based on flags, or on what was actually redeemed
         # DEV NOTE: We track any_keys_redeemed/any_codes_redeemed to produce a truthful final summary.
@@ -1022,7 +1168,7 @@ if __name__ == "__main__":
     _L.setLevel(INFO)
     if args.verbose:
         _L.setLevel(DEBUG)
-        _L.debug("Debug mode on")
+        _L.debug("[#AF0000]Debug mode on[/]", extra={"rich_markup": True})
 
     if getattr(args, "dump_csv", None):
         dump_db_to_csv(args.dump_csv)

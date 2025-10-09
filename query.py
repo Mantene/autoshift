@@ -36,7 +36,7 @@ from typing import (
 
 import requests
 
-from common import _L, DIRNAME
+from common import _L, DIRNAME, dim_text
 
 try:
     from common import DATA_DIR, data_path
@@ -376,7 +376,8 @@ class Database(ContextManager):
         )
         if el.fetchone():
             return None
-        _L.debug(f"== inserting {key.game} Key '{key.code}' for {key.platform} ==")
+        message = f"== inserting {key.game} Key '{key.code}' for {key.platform} =="
+        _L.debug(dim_text(message), extra={"rich_markup": True})
         self.execute(
             "INSERT INTO keys(reward, code, platform, game, source) VALUES (?,?,?,?,?)",
             (
